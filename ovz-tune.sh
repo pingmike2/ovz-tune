@@ -14,6 +14,8 @@
 #   ovz-tune --apply --hostname myhost        同时改主机名
 #   ovz-tune --apply --journald-max 200M      指定 journald 上限（默认按内存自动）
 #   ovz-tune --apply --swap 1024              尝试加 1G swap（容器里会自动放弃）
+#   ovz-tune --apply --mtu auto               实测路径 MTU 并采用最优值
+#   ovz-tune --apply --mtu 1400               直接指定 MTU 并持久化
 #   ovz-tune --apply --upgrade                同时 apt 升级（可能重启服务，默认不做）
 #   ovz-tune --rollback                       撤销本脚本的所有改动
 #
@@ -21,7 +23,7 @@
 #
 set -u
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 ARGC=$#
 
 usage() {
@@ -35,6 +37,8 @@ ovz-tune — OpenVZ / LXC / KVM 一键调优（Debian / Ubuntu）
   ovz-tune --apply --hostname myhost        同时改主机名
   ovz-tune --apply --journald-max 200M      指定 journald 上限
   ovz-tune --apply --swap 1024              尝试加 1G swap
+  ovz-tune --apply --mtu auto               实测路径 MTU，采用最优值
+  ovz-tune --apply --mtu 1400               直接指定 MTU
   ovz-tune --apply --upgrade                同时 apt 升级
   ovz-tune --rollback                       撤销本脚本的所有改动
 
@@ -43,7 +47,7 @@ EOF
 }
 
 DRY=1; DO_ROLLBACK=0; DO_UPGRADE=0
-TZ_NAME=""; NEW_HOST=""; SWAP_MB=0; JOURNALD_MAX=""
+TZ_NAME=""; NEW_HOST=""; SWAP_MB=0; JOURNALD_MAX=""; MTU_WANT=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -55,6 +59,7 @@ while [ $# -gt 0 ]; do
     --hostname)    NEW_HOST="${2:-}"; shift ;;
     --journald-max) JOURNALD_MAX="${2:-}"; shift ;;
     --swap)        SWAP_MB="${2:-0}"; shift ;;
+    --mtu)         MTU_WANT="${2:-auto}"; shift ;;
     -h|--help)     usage; exit 0 ;;
     -V|--version)  echo "ovz-tune $VERSION"; exit 0 ;;
     *) echo "未知参数: $1（--help 看用法）"; exit 2 ;;
@@ -75,6 +80,7 @@ menu() {
   │  4) 执行 + 改主机名                     │
   │  5) 执行 + apt 升级                     │
   │  6) 回滚上一轮改动                      │
+  │  7) 侦测路径 MTU（TLS 卡顿排查）        │
   │  0) 退出                                │
   └─────────────────────────────────────────┘
 EOF
@@ -88,6 +94,7 @@ EOF
     4) DRY=0; printf '新主机名: '; read -r NEW_HOST || true ;;
     5) DRY=0; DO_UPGRADE=1 ;;
     6) DO_ROLLBACK=1; DRY=0 ;;
+    7) DRY=0; MTU_WANT=auto ;;
     0) exit 0 ;;
     *) echo "无效选项: $ans"; exit 2 ;;
   esac
@@ -136,26 +143,39 @@ detect() {
 
   VIRT=unknown
   if [ -f /proc/user_beancounters ]; then VIRT=openvz
-  elif grep -qa 'lxc' /proc/1/cgroup 2>/dev/null; then VIRT=lxc
+  elif grep -qaE 'lxc|incus' /proc/1/cgroup 2>/dev/null; then VIRT=lxc
   elif [ -f /.dockerenv ]; then VIRT=docker
   elif command -v systemd-detect-virt >/dev/null 2>&1; then
     VIRT=$(systemd-detect-virt 2>/dev/null || echo unknown)
   fi
+  case "$VIRT" in
+    openvz|lxc|incus|docker|podman|systemd-nspawn) CONTAINER=1 ;;
+    *) CONTAINER=0 ;;
+  esac
 
   MEM_MB=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
   [ -z "${MEM_MB:-}" ] && MEM_MB=0
 
   DEFAULT_IF=$(ip -o route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
   [ -z "${DEFAULT_IF:-}" ] && DEFAULT_IF=""
+
+  # 只有私网地址 = 典型 NAT 小鸡（公网由宿主端口转发）
+  PRIV_NET=0
+  if [ -n "$DEFAULT_IF" ]; then
+    if ip -4 -o addr show dev "$DEFAULT_IF" 2>/dev/null | grep -qE 'inet (10\.|127\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)'; then
+      PRIV_NET=1
+    fi
+  fi
 }
 
 detect
 
 head2 "环境"
 say "  发行版 : ${DISTRO} ${DISTRO_VER}  (包管理: ${PKG})"
-say "  虚拟化 : ${VIRT}"
+say "  虚拟化 : ${VIRT}$( [ "$CONTAINER" = 1 ] && echo ' · 共享内核容器' )$( [ "$PRIV_NET" = 1 ] && echo ' · 私网 NAT' )"
 say "  内存   : ${MEM_MB} MB"
 say "  默认网卡: ${DEFAULT_IF:-无}  qdisc: $(tc qdisc show dev "${DEFAULT_IF:-lo}" 2>/dev/null | awk '{print $2}' | head -1)"
+say "  MTU    : $(cat "/sys/class/net/${DEFAULT_IF:-lo}/mtu" 2>/dev/null || echo '?')"
 say "  模式   : $([ "$DRY" = 1 ] && echo 演练-不改动 || echo 执行)"
 
 if [ "$PKG" = none ]; then warn "非 Debian/Ubuntu 系，跳过 apt 相关步骤"; fi
@@ -172,6 +192,15 @@ if [ "$DO_ROLLBACK" = 1 ]; then
   fi
   if [ -n "${DEFAULT_IF:-}" ] && tc qdisc show dev "$DEFAULT_IF" 2>/dev/null | grep -qw fq; then
     tc qdisc replace dev "$DEFAULT_IF" root fq_codel 2>/dev/null && ok "qdisc 恢复 fq_codel"
+  fi
+  if [ -f /etc/systemd/system/ovz-tune-mtu.service ]; then
+    systemctl disable --now ovz-tune-mtu.service >/dev/null 2>&1
+    rm -f /etc/systemd/system/ovz-tune-mtu.service
+    systemctl daemon-reload 2>/dev/null
+    ok "已移除 MTU 持久化 unit（当前 MTU 不自动还原）"
+  fi
+  if [ -L /etc/systemd/system/systemd-hostnamed.service ]; then
+    systemctl unmask systemd-hostnamed.service >/dev/null 2>&1 && ok "已解除 systemd-hostnamed 的 mask"
   fi
   sysctl --system >/dev/null 2>&1 && ok "已重新加载 sysctl"
   systemctl restart systemd-journald 2>/dev/null && ok "journald 已重启"
@@ -223,18 +252,24 @@ if [ "$VIRT" != openvz ]; then
   try_kv net.ipv4.tcp_keepalive_probes 5
   try_kv net.ipv4.tcp_mtu_probing 1
   try_kv net.ipv4.tcp_slow_start_after_idle 0
+  try_kv net.ipv4.tcp_notsent_lowat 131072
   try_kv net.ipv4.tcp_max_syn_backlog 8192 min
   try_kv net.core.netdev_max_backlog 16384 min
   try_kv net.netfilter.nf_conntrack_max 262144 min
 
-  # 缓冲区按内存定档，1.5G 以下不贪大
+  # 缓冲区按内存定档，1.5G 以下不贪大；512MB 以下直接保留内核默认
   if [ "$MEM_MB" -ge 4096 ]; then BUF=33554432
   elif [ "$MEM_MB" -ge 2048 ]; then BUF=16777216
   else BUF=8388608; fi
   try_kv net.core.rmem_max "$BUF" min
   try_kv net.core.wmem_max "$BUF" min
-  try_kv "net.ipv4.tcp_rmem" "4096 87380 $BUF"
-  try_kv "net.ipv4.tcp_wmem" "4096 65536 $BUF"
+  if [ "$MEM_MB" -lt 512 ]; then
+    SKIPPED+=("net.ipv4.tcp_rmem|内存 ${MEM_MB}MB <512MB，保留内核默认")
+    SKIPPED+=("net.ipv4.tcp_wmem|内存 ${MEM_MB}MB <512MB，保留内核默认")
+  else
+    try_kv "net.ipv4.tcp_rmem" "4096 87380 $BUF"
+    try_kv "net.ipv4.tcp_wmem" "4096 65536 $BUF"
+  fi
 else
   # OpenVZ 的 vm.* 一律 EINVAL，直接标注原因，不去刷报错
   for k in vm.swappiness vm.vfs_cache_pressure vm.dirty_ratio vm.dirty_background_ratio; do
@@ -277,6 +312,90 @@ if [ -n "${DEFAULT_IF:-}" ]; then
         skip "$DEFAULT_IF qdisc 无法修改（$QD）"
       fi ;;
   esac
+fi
+
+# ---------- 路径 MTU ----------
+mtu_tls() {
+  local s="" v
+  for _ in 1 2 3; do
+    v=$(curl -4 -s -o /dev/null -w '%{time_appconnect}' -m 8 https://www.cloudflare.com 2>/dev/null || echo 9)
+    s="$s $v"
+  done
+  printf '%s\n' "$s" | tr ' ' '\n' | sed '/^$/d' | sort -n | sed -n 2p
+}
+
+mtu_persist() {
+  local m=$1 ifc=$DEFAULT_IF u=/etc/systemd/system/ovz-tune-mtu.service
+  cat > "$u" <<EOF
+[Unit]
+Description=ovz-tune: set $ifc MTU $m
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/ip link set dev $ifc mtu $m
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload 2>/dev/null
+  if systemctl enable ovz-tune-mtu.service >/dev/null 2>&1; then
+    ok "已持久化到 $u"
+  else
+    warn "写入 $u 后 enable 失败，重启后需手动设置"
+  fi
+}
+
+if [ -n "$MTU_WANT" ]; then
+  head2 "路径 MTU"
+  if [ -z "$DEFAULT_IF" ]; then
+    skip "没有默认网卡，无法测试"
+  elif ! command -v curl >/dev/null 2>&1; then
+    skip "没有 curl，无法做 TLS 计时"
+  elif [ "$DRY" = 1 ]; then
+    if [ "$MTU_WANT" = auto ]; then
+      plan "依次试 1500/1460/1450/1444/1436/1400，比 TLS 握手耗时取最优"
+    else
+      plan "把 $DEFAULT_IF 的 MTU 设为 $MTU_WANT 并持久化"
+    fi
+  else
+    CUR_MTU=$(cat "/sys/class/net/$DEFAULT_IF/mtu" 2>/dev/null || echo 0)
+    say "  网卡 $DEFAULT_IF 当前 MTU $CUR_MTU"
+    if ! ip link set dev "$DEFAULT_IF" mtu "$CUR_MTU" 2>/dev/null; then
+      skip "无权修改 MTU（veth 由宿主决定）"
+    else
+      BASE_T=$(mtu_tls)
+      say "  当前 MTU 基线: TLS $(printf '%.3f' "$BASE_T")s"
+      if [ "$MTU_WANT" = auto ]; then TARGETS="1500 1460 1450 1444 1436 1400"
+      else TARGETS="$MTU_WANT"; fi
+      BEST_M=""; BEST_T=""
+      for m in $TARGETS; do
+        if ! ip link set dev "$DEFAULT_IF" mtu "$m" 2>/dev/null; then
+          say "  MTU $m   不可用（超出允许范围）"; continue
+        fi
+        t=$(mtu_tls)
+        printf '  MTU %-5s TLS %.3fs\n' "$m" "$t"
+        if [ -z "$BEST_T" ] || awk "BEGIN{exit !($t < $BEST_T)}"; then BEST_T=$t; BEST_M=$m; fi
+      done
+      if [ "$MTU_WANT" = auto ]; then
+        ip link set dev "$DEFAULT_IF" mtu "$CUR_MTU" 2>/dev/null
+        if [ -n "$BEST_M" ] && [ "$BEST_M" != "$CUR_MTU" ] \
+           && awk "BEGIN{exit !($BASE_T > 0.5 && $BEST_T < 0.15)}"; then
+          ip link set dev "$DEFAULT_IF" mtu "$BEST_M" 2>/dev/null && ok "已切到 MTU $BEST_M（TLS 降至 $(printf '%.3f' "$BEST_T")s）"
+          mtu_persist "$BEST_M"
+          CHANGED+=("MTU $BEST_M")
+        else
+          ok "路径 MTU 未发现黑洞，保持 $CUR_MTU"
+        fi
+      else
+        ip link set dev "$DEFAULT_IF" mtu "$MTU_WANT" 2>/dev/null && ok "MTU 已设为 $MTU_WANT"
+        mtu_persist "$MTU_WANT"
+        CHANGED+=("MTU $MTU_WANT")
+      fi
+    fi
+  fi
 fi
 
 # ---------- 持久化 sysctl ----------
@@ -375,14 +494,52 @@ EOF
         echo "ClientAliveCountMax 3"
         echo "$END_MARK"
       } >> /etc/ssh/sshd_config
-      ok "已追加到 /etc/ssh/sshd_config（该版本无 sshd_config.d）"
+      ok "已追加到 /etc/ssh/sshd_config（该版本主配置无 Include 行）"
     fi
   fi
+  mkdir -p /run/sshd 2>/dev/null
   if sshd -t 2>/dev/null; then
-    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || service ssh reload 2>/dev/null
-    ok "sshd 配置校验通过并已 reload"
+    if systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || service ssh reload 2>/dev/null; then
+      ok "sshd 配置校验通过并已 reload"
+    else
+      ok "sshd 配置校验通过（socket 激活模式，新连接自动读取配置）"
+    fi
   else
-    warn "sshd -t 校验失败，未 reload，请检查 /etc/ssh/ 配置"
+    warn "sshd -t 校验失败，未 reload：$(sshd -t 2>&1 | head -1)"
+  fi
+fi
+
+# ---------- 残留失败单元 ----------
+head2 "失败单元"
+if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
+  skip "无 systemd"
+else
+  if [ "$CONTAINER" = 1 ] && systemctl status systemd-hostnamed.service 2>/dev/null | grep -q 'status=225/NETWORK'; then
+    if [ "$DRY" = 1 ]; then
+      plan "mask systemd-hostnamed（容器无 netns 权限，永远起不来）"
+    elif systemctl mask systemd-hostnamed.service >/dev/null 2>&1; then
+      ok "已 mask systemd-hostnamed（代价：hostnamectl 不可用，改主机名直接写 /etc/hostname）"
+      CHANGED+=("mask systemd-hostnamed")
+    fi
+  fi
+  FAILED_N=$(systemctl --failed --plain --no-legend 2>/dev/null | wc -l)
+  if [ "$FAILED_N" -eq 0 ]; then
+    ok "没有失败单元"
+  else
+    # 只清 ssh@（每连接 sshd 的死连接残留）和 session-*，其他失败单元保留并提示
+    STALE=$(systemctl --failed --plain --no-legend 2>/dev/null | awk '{print $1}' | grep -cE '^(ssh@|session-)')
+    OTHER=$(systemctl --failed --plain --no-legend 2>/dev/null | awk '{print $1}' | grep -vE '^(ssh@|session-)' | head -3 | tr '\n' ' ')
+    if [ "$STALE" -gt 0 ]; then
+      if [ "$DRY" = 1 ]; then
+        plan "reset-failed 清掉 $STALE 个 ssh 会话残留（不动真实服务）"
+      else
+        systemctl reset-failed 'ssh@*' 'session-*' >/dev/null 2>&1
+        ok "已清掉 $STALE 个 ssh 会话残留"
+      fi
+    fi
+    if [ -n "$OTHER" ]; then
+      warn "另有失败单元未处理：$OTHER"
+    fi
   fi
 fi
 
@@ -452,12 +609,40 @@ fi
 # ---------- 升级 ----------
 if [ "$DO_UPGRADE" = 1 ] && [ "$PKG" = apt ]; then
   head2 "apt 升级"
-  if [ "$DRY" = 1 ]; then plan "apt-get update && upgrade"
+  if [ "$DRY" = 1 ]; then
+    plan "apt-get update；若源已下线自动切 archive.debian.org，然后 upgrade"
+    plan "升级任务放到独立 systemd unit，SSH 断开也不会打断 dpkg"
   else
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1 | tail -3
-    DEBIAN_FRONTEND=noninteractive apt-get -y upgrade 2>&1 | tail -4
-    DEBIAN_FRONTEND=noninteractive apt-get -y autoremove --purge >/dev/null 2>&1
-    apt-get clean
+    UPD=$(apt-get update -qq 2>&1 | tail -20)
+    BAD=$(printf '%s' "$UPD" | grep -cE '404|Release file .* (expired|not valid)')
+    if [ "$BAD" -gt 0 ]; then
+      warn "软件源已下线（${DISTRO} ${DISTRO_VER} 已 EOL），切换 archive.debian.org"
+      backup_once /etc/apt/sources.list
+      sed -i 's|deb.debian.org/debian-security|archive.debian.org/debian-security|g; s|deb.debian.org/debian|archive.debian.org/debian|g' /etc/apt/sources.list
+      printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99archive-allow
+      apt-get update -qq 2>&1 | tail -3
+      CHANGED+=("apt 源 -> archive.debian.org")
+    fi
+
+    APT_CMD="export DEBIAN_FRONTEND=noninteractive; apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade; apt-get -y autoremove --purge; apt-get clean"
+    if command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+      LOG=/tmp/ovz-tune-upgrade.log
+      : > "$LOG"
+      systemctl reset-failed ovz-tune-upgrade >/dev/null 2>&1
+      if systemd-run --unit=ovz-tune-upgrade --collect --quiet \
+           --property=StandardOutput=append:"$LOG" \
+           --property=StandardError=append:"$LOG" \
+           /bin/bash -c "$APT_CMD" >/dev/null 2>&1; then
+        say "  升级已在独立 unit 中运行（ovz-tune-upgrade），断线不会打断 dpkg"
+        while systemctl is-active ovz-tune-upgrade >/dev/null 2>&1; do sleep 5; done
+        tail -4 "$LOG"
+      else
+        warn "systemd-run 启动失败，改为前台执行"
+        bash -c "$APT_CMD" 2>&1 | tail -4
+      fi
+    else
+      bash -c "$APT_CMD" 2>&1 | tail -4
+    fi
     ok "升级完成，剩余可升级: $(apt-get -s upgrade 2>/dev/null | grep -oE '^[0-9]+ upgraded' || echo 0)"
   fi
 fi
